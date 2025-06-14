@@ -1,3 +1,4 @@
 env310/
 ignore
 test.ipynb
+.env
