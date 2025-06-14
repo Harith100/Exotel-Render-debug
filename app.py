@@ -291,9 +291,39 @@ class TranscriptionHandler:
 # Global instances
 active_streams = {}
 
+@app.route('/call', methods=['POST'])
+def handle_call():
+    """Handle incoming call from Exotel and return XML response"""
+    try:
+        # Log the incoming call data
+        call_data = request.get_json() or request.form.to_dict()
+        app.logger.info(f"Incoming call: {call_data}")
+        
+        # Return XML response to connect to WebSocket
+        response = '''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="wss://exotel-render-debug.onrender.com/media"/>
+    </Connect>
+</Response>'''
+        
+        return response, 200, {'Content-Type': 'application/xml'}
+        
+    except Exception as e:
+        app.logger.error(f"Error handling call: {str(e)}")
+        return '''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Sorry, there was an error. Please try again later.</Say>
+</Response>''', 500, {'Content-Type': 'application/xml'}
+
+
 @sockets.route('/media')
 def handle_media_stream(ws):
     app.logger.info("New WebSocket connection accepted")
+    
+    if not ws:
+        app.logger.error("Invalid WebSocket connection")
+        return
     
     stream_sid = None
     audio_stream = None
@@ -302,89 +332,53 @@ def handle_media_stream(ws):
     
     try:
         while not ws.closed:
-            message = ws.receive()
-            if message is None:
-                continue
+            try:
+                message = ws.receive()
+                if message is None:
+                    app.logger.info("Received None message, connection might be closing")
+                    break
 
-            data = json.loads(message)
-            
-            if data['event'] == "connected":
-                app.logger.info(f"Connected: {data}")
+                # Handle both Exotel and Twilio formats
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError as e:
+                    app.logger.error(f"Invalid JSON received: {message[:100]}...")
+                    continue
                 
-            elif data['event'] == "start":
-                app.logger.info(f"Stream started: {data}")
-                stream_sid = data['start']['streamSid']
+                # Handle different event types
+                event_type = data.get('event', data.get('type', 'unknown'))
                 
-                # Initialize audio stream
-                RATE = 8000
-                CHUNK = int(RATE / 10)
-                audio_stream = AudioStream(RATE, CHUNK)
-                audio_stream.__enter__()
-                
-                # Setup speech recognition
-                config = speech.RecognitionConfig(
-                    encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
-                    sample_rate_hertz=RATE,
-                    language_code="ml-IN",  # Malayalam
-                    enable_automatic_punctuation=True,
-                    model="telephony"  # Better for phone calls
-                )
-                
-                streaming_config = speech.StreamingRecognitionConfig(
-                    config=config,
-                    interim_results=True,
-                    single_utterance=False
-                )
-                
-                # Start transcription
-                transcription_handler = TranscriptionHandler(voicebot, ws, stream_sid)
-                
-                def transcribe():
-                    try:
-                        while not ws.closed and audio_stream and not audio_stream.closed:
-                            audio_generator = audio_stream.generator()
-                            requests = (
-                                speech.StreamingRecognizeRequest(audio_content=content)
-                                for content in audio_generator
-                            )
-                            
-                            responses = voicebot.speech_client.streaming_recognize(
-                                streaming_config, requests
-                            )
-                            
-                            transcription_handler.process_transcript(responses)
-                            
-                    except Exception as e:
-                        app.logger.error(f"Transcription error: {str(e)}")
-                
-                transcription_thread = threading.Thread(target=transcribe)
-                transcription_thread.daemon = True
-                transcription_thread.start()
-                
-                active_streams[stream_sid] = {
-                    'stream': audio_stream,
-                    'handler': transcription_handler,
-                    'thread': transcription_thread
-                }
-                
-            elif data['event'] == "media":
-                if audio_stream:
-                    payload = data['media']['payload']
-                    chunk = base64.b64decode(payload)
-                    audio_stream.fill_buffer(chunk)
+                if event_type in ["connected", "connection"]:
+                    app.logger.info(f"Connection established: {data}")
                     
-            elif data['event'] == "mark":
-                app.logger.info(f"Mark received: {data}")
-                
-            elif data['event'] == "stop":
-                app.logger.info(f"Stream stopped: {data}")
-                break
+                elif event_type in ["start", "stream_start"]:
+                    app.logger.info(f"Stream started: {data}")
+                    # Initialize your audio processing here
+                    # ... rest of your existing start logic ...
+                    
+                elif event_type in ["media", "audio"]:
+                    if audio_stream:
+                        # Handle audio data - adapt for Exotel format
+                        payload = data.get('payload', data.get('audio', ''))
+                        if payload:
+                            chunk = base64.b64decode(payload)
+                            audio_stream.fill_buffer(chunk)
+                        
+                elif event_type in ["stop", "stream_end"]:
+                    app.logger.info(f"Stream stopped: {data}")
+                    break
+                else:
+                    app.logger.info(f"Unknown event type: {event_type}, data: {data}")
+                    
+            except Exception as e:
+                app.logger.error(f"Error processing message: {str(e)}")
+                continue
 
     except Exception as e:
         app.logger.error(f"WebSocket error: {str(e)}")
     
     finally:
-        # Cleanup
+        # Cleanup code remains the same
         if stream_sid and stream_sid in active_streams:
             stream_data = active_streams[stream_sid]
             if stream_data['stream']:
@@ -392,6 +386,18 @@ def handle_media_stream(ws):
             del active_streams[stream_sid]
         
         app.logger.info("WebSocket connection closed")
+
+# 3. Add a simple HTTP endpoint to test WebSocket accessibility
+@app.route('/media', methods=['GET'])
+def media_info():
+    """Info endpoint for WebSocket - prevents 400 errors from HTTP requests"""
+    return {
+        'message': 'This is a WebSocket endpoint. Use wss:// to connect.',
+        'websocket_url': 'wss://exotel-render-debug.onrender.com/media',
+        'status': 'WebSocket endpoint active'
+    }
+
+
 
 @app.route('/health')
 def health_check():
@@ -402,12 +408,32 @@ def health_check():
         'active_streams': len(active_streams)
     }
 
+# 4. Enhanced webhook endpoint
 @app.route('/webhook', methods=['POST'])
 def exotel_webhook():
-    """Handle Exotel webhooks"""
-    data = request.get_json()
-    app.logger.info(f"Webhook received: {data}")
-    return {'status': 'received'}
+    """Enhanced webhook handler for Exotel events"""
+    try:
+        # Handle both JSON and form data
+        if request.is_json:
+            data = request.get_json()
+        else:
+            data = request.form.to_dict()
+            
+        app.logger.info(f"Webhook received: {data}")
+        
+        # Process different webhook events
+        event_type = data.get('EventType', data.get('event_type', 'unknown'))
+        
+        if event_type == 'CallStarted':
+            app.logger.info(f"Call started: {data.get('CallSid', 'unknown')}")
+        elif event_type == 'CallEnded':
+            app.logger.info(f"Call ended: {data.get('CallSid', 'unknown')}")
+        
+        return {'status': 'received', 'event': event_type}
+        
+    except Exception as e:
+        app.logger.error(f"Webhook error: {str(e)}")
+        return {'status': 'error', 'message': str(e)}, 500
 
 if __name__ == '__main__':
     # Validate environment variables
