@@ -118,10 +118,10 @@ class MalayalamVoiceBot:
             ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
         )
         
-        # Audio configuration for TTS
+        # Audio configuration for TTS - Updated for Exotel format
         self.audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000  # Match Exotel's expected rate
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,  # Exotel expects LINEAR16
+            sample_rate_hertz=8000  # Exotel uses 8kHz
         )
         
         app.logger.info("MalayalamVoiceBot initialized")
@@ -258,30 +258,25 @@ class TranscriptionHandler:
                     self.processing_response = False
 
     def send_audio_response(self, text):
-        """Convert text to speech and send via websocket"""
+        """Convert text to speech and send via websocket - Updated for Exotel format"""
         try:
             audio_content = self.voicebot.text_to_speech(text)
             
             if audio_content and not self.websocket.closed:
-                # Convert audio to base64 and send via websocket
+                # Convert audio to base64 for Exotel format
                 audio_b64 = base64.b64encode(audio_content).decode('ascii')
                 
-                # Split audio into chunks for streaming
-                chunk_size = 1024  # Adjust based on needs
-                for i in range(0, len(audio_b64), chunk_size):
-                    chunk = audio_b64[i:i + chunk_size]
-                    
-                    message = {
-                        'event': 'media',
-                        'stream_sid': self.stream_sid,
-                        'media': {
-                            'payload': chunk
-                        }
+                # Send audio in Exotel format - single message with full audio
+                message = {
+                    'event': 'media',
+                    'stream_sid': self.stream_sid,
+                    'media': {
+                        'payload': audio_b64
                     }
-                    
-                    if not self.websocket.closed:
-                        self.websocket.send(json.dumps(message))
-                        time.sleep(0.05)  # Small delay between chunks
+                }
+                
+                if not self.websocket.closed:
+                    self.websocket.send(json.dumps(message))
                 
                 app.logger.info(f"Sent audio response: {len(audio_content)} bytes")
                 
@@ -331,6 +326,9 @@ def handle_media_stream(ws):
     transcription_thread = None
     
     try:
+        # Initialize voicebot instance
+        voicebot = MalayalamVoiceBot()
+        
         while not ws.closed:
             try:
                 message = ws.receive()
@@ -338,35 +336,89 @@ def handle_media_stream(ws):
                     app.logger.info("Received None message, connection might be closing")
                     break
 
-                # Handle both Exotel and Twilio formats
+                # Parse JSON message
                 try:
                     data = json.loads(message)
+                    app.logger.info(f"Received message: {data}")
                 except json.JSONDecodeError as e:
                     app.logger.error(f"Invalid JSON received: {message[:100]}...")
                     continue
                 
-                # Handle different event types
-                event_type = data.get('event', data.get('type', 'unknown'))
+                # Handle different event types - Updated for Exotel format
+                event_type = data.get('event', 'unknown')
                 
-                if event_type in ["connected", "connection"]:
-                    app.logger.info(f"Connection established: {data}")
+                if event_type == "connected":
+                    app.logger.info(f"WebSocket connected: {data}")
                     
-                elif event_type in ["start", "stream_start"]:
+                elif event_type == "start":
                     app.logger.info(f"Stream started: {data}")
-                    # Initialize your audio processing here
-                    # ... rest of your existing start logic ...
+                    stream_sid = data.get('stream_sid', data.get('streamSid', 'unknown'))
                     
-                elif event_type in ["media", "audio"]:
-                    if audio_stream:
-                        # Handle audio data - adapt for Exotel format
-                        payload = data.get('payload', data.get('audio', ''))
-                        if payload:
+                    # Initialize audio stream for Exotel (8kHz, LINEAR16)
+                    audio_stream = AudioStream(8000, 1024)
+                    audio_stream.__enter__()
+                    
+                    # Initialize transcription handler
+                    transcription_handler = TranscriptionHandler(voicebot, ws, stream_sid)
+                    
+                    # Configure speech recognition for Exotel format
+                    config = speech.RecognitionConfig(
+                        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,  # Exotel uses LINEAR16
+                        sample_rate_hertz=8000,  # Exotel uses 8kHz
+                        language_code="ml-IN",
+                        enable_automatic_punctuation=True,
+                        model="telephony",
+                        use_enhanced=True
+                    )
+                    
+                    streaming_config = speech.StreamingRecognitionConfig(
+                        config=config,
+                        interim_results=True,
+                        single_utterance=False
+                    )
+                    
+                    # Start transcription in separate thread
+                    audio_generator = audio_stream.generator()
+                    requests = (speech.StreamingRecognizeRequest(audio_content=chunk)
+                              for chunk in audio_generator)
+                    
+                    def transcribe():
+                        try:
+                            responses = voicebot.speech_client.streaming_recognize(
+                                streaming_config, requests
+                            )
+                            transcription_handler.process_transcript(responses)
+                        except Exception as e:
+                            app.logger.error(f"Transcription error: {str(e)}")
+                    
+                    transcription_thread = Thread(target=transcribe)
+                    transcription_thread.daemon = True
+                    transcription_thread.start()
+                    
+                    # Store stream data
+                    active_streams[stream_sid] = {
+                        'stream': audio_stream,
+                        'handler': transcription_handler,
+                        'thread': transcription_thread
+                    }
+                    
+                elif event_type == "media" and audio_stream:
+                    # Handle audio data - Updated for Exotel format
+                    media_data = data.get('media', {})
+                    payload = media_data.get('payload', '')
+                    
+                    if payload:
+                        try:
+                            # Decode base64 audio data (Exotel sends LINEAR16 PCM)
                             chunk = base64.b64decode(payload)
                             audio_stream.fill_buffer(chunk)
+                        except Exception as e:
+                            app.logger.error(f"Error processing audio chunk: {str(e)}")
                         
-                elif event_type in ["stop", "stream_end"]:
+                elif event_type == "stop":
                     app.logger.info(f"Stream stopped: {data}")
                     break
+                    
                 else:
                     app.logger.info(f"Unknown event type: {event_type}, data: {data}")
                     
@@ -378,26 +430,27 @@ def handle_media_stream(ws):
         app.logger.error(f"WebSocket error: {str(e)}")
     
     finally:
-        # Cleanup code remains the same
+        # Cleanup
         if stream_sid and stream_sid in active_streams:
             stream_data = active_streams[stream_sid]
             if stream_data['stream']:
                 stream_data['stream'].__exit__(None, None, None)
             del active_streams[stream_sid]
         
+        if audio_stream:
+            audio_stream.__exit__(None, None, None)
+            
         app.logger.info("WebSocket connection closed")
 
-# 3. Add a simple HTTP endpoint to test WebSocket accessibility
 @app.route('/media', methods=['GET'])
 def media_info():
     """Info endpoint for WebSocket - prevents 400 errors from HTTP requests"""
     return {
         'message': 'This is a WebSocket endpoint. Use wss:// to connect.',
         'websocket_url': 'wss://exotel-render-debug.onrender.com/media',
-        'status': 'WebSocket endpoint active'
+        'status': 'WebSocket endpoint active',
+        'active_streams': len(active_streams)
     }
-
-
 
 @app.route('/health')
 def health_check():
@@ -405,10 +458,11 @@ def health_check():
     return {
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'active_streams': len(active_streams)
+        'active_streams': len(active_streams),
+        'credentials_configured': bool(GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_CREDENTIALS_JSON),
+        'gemini_configured': bool(GEMINI_API_KEY)
     }
 
-# 4. Enhanced webhook endpoint
 @app.route('/webhook', methods=['POST'])
 def exotel_webhook():
     """Enhanced webhook handler for Exotel events"""
@@ -435,6 +489,31 @@ def exotel_webhook():
         app.logger.error(f"Webhook error: {str(e)}")
         return {'status': 'error', 'message': str(e)}, 500
 
+@app.route('/test-tts', methods=['POST'])
+def test_tts():
+    """Test endpoint for TTS functionality"""
+    try:
+        data = request.get_json()
+        text = data.get('text', 'ഹലോ, എങ്ങനെയുണ്ട്?')  # "Hello, how are you?" in Malayalam
+        
+        voicebot = MalayalamVoiceBot()
+        audio_content = voicebot.text_to_speech(text)
+        
+        if audio_content:
+            audio_b64 = base64.b64encode(audio_content).decode('ascii')
+            return {
+                'status': 'success',
+                'text': text,
+                'audio_length': len(audio_content),
+                'audio_base64': audio_b64[:100] + '...'  # First 100 chars for testing
+            }
+        else:
+            return {'status': 'error', 'message': 'Failed to generate audio'}
+            
+    except Exception as e:
+        app.logger.error(f"TTS test error: {str(e)}")
+        return {'status': 'error', 'message': str(e)}, 500
+
 if __name__ == '__main__':
     # Validate environment variables
     if not GOOGLE_APPLICATION_CREDENTIALS and not GOOGLE_CLOUD_CREDENTIALS_JSON:
@@ -445,7 +524,7 @@ if __name__ == '__main__':
         app.logger.error("GEMINI_API_KEY not set")
         sys.exit(1)
 
-    # Initialize voicebot (this will test credentials)
+    # Test initialization
     try:
         voicebot = MalayalamVoiceBot()
         app.logger.info("MalayalamVoiceBot initialized successfully")
@@ -463,8 +542,9 @@ if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
 
     app.logger.info(f"Starting Malayalam VoiceBot server on {args.host}:{args.port}")
-    app.logger.info(f"WebSocket endpoint: ws://{args.host}:{args.port}/media")
+    app.logger.info(f"WebSocket endpoint: wss://{args.host}:{args.port}/media")
     app.logger.info(f"Health check: http://{args.host}:{args.port}/health")
+    app.logger.info(f"TTS Test: http://{args.host}:{args.port}/test-tts")
 
     server = pywsgi.WSGIServer((args.host, args.port), app, handler_class=WebSocketHandler)
     
