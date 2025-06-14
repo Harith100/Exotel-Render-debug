@@ -340,6 +340,12 @@ def test_init():
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
+    
+    try:
+        socket.gethostbyname('api.sarvam.ai')
+        print("DNS resolution successful")
+    except socket.gaierror as e:
+        print(f"DNS resolution failed: {e}")
     return jsonify({"status": "healthy", "active_connections": len(active_connections)})
 
 @app.route('/', methods=['GET'])
