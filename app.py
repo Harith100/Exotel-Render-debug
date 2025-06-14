@@ -9,6 +9,7 @@ import base64
 import signal
 import logging
 import threading
+import tempfile
 from datetime import datetime
 
 from flask import Flask, request
@@ -18,14 +19,11 @@ from threading import Thread
 from gevent import pywsgi
 from geventwebsocket.handler import WebSocketHandler
 
-from dotenv import load_dotenv
-load_dotenv()
-
-
 # Google Cloud imports
 from google.cloud import speech_v1p1beta1 as speech
 from google.cloud import texttospeech
 import google.generativeai as genai
+from google.oauth2 import service_account
 
 # Configure logging
 logging.basicConfig(
@@ -43,7 +41,56 @@ app.logger.setLevel(logging.INFO)
 
 # Environment variables
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+GOOGLE_CLOUD_CREDENTIALS_JSON = os.getenv('GOOGLE_CLOUD_CREDENTIALS_JSON')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+
+def setup_google_credentials():
+    """Setup Google Cloud credentials from environment variables"""
+    credentials = None
+    
+    if GOOGLE_CLOUD_CREDENTIALS_JSON:
+        # If JSON content is provided directly
+        try:
+            credentials_info = json.loads(GOOGLE_CLOUD_CREDENTIALS_JSON)
+            credentials = service_account.Credentials.from_service_account_info(credentials_info)
+            app.logger.info("Using Google Cloud credentials from JSON content")
+            return credentials
+        except json.JSONDecodeError as e:
+            app.logger.error(f"Invalid JSON in GOOGLE_CLOUD_CREDENTIALS_JSON: {e}")
+    
+    if GOOGLE_APPLICATION_CREDENTIALS:
+        # Check if it's JSON content or file path
+        if GOOGLE_APPLICATION_CREDENTIALS.startswith('{'):
+            # It's JSON content, create a temporary file
+            try:
+                credentials_info = json.loads(GOOGLE_APPLICATION_CREDENTIALS)
+                
+                # Create a temporary file
+                temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+                json.dump(credentials_info, temp_file)
+                temp_file.close()
+                
+                # Set the environment variable to the temp file path
+                os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_file.name
+                app.logger.info(f"Created temporary credentials file: {temp_file.name}")
+                
+                # Load credentials from the temp file
+                credentials = service_account.Credentials.from_service_account_file(temp_file.name)
+                return credentials
+                
+            except json.JSONDecodeError as e:
+                app.logger.error(f"Invalid JSON in GOOGLE_APPLICATION_CREDENTIALS: {e}")
+        else:
+            # It's a file path
+            if os.path.exists(GOOGLE_APPLICATION_CREDENTIALS):
+                credentials = service_account.Credentials.from_service_account_file(GOOGLE_APPLICATION_CREDENTIALS)
+                app.logger.info(f"Using Google Cloud credentials from file: {GOOGLE_APPLICATION_CREDENTIALS}")
+                return credentials
+            else:
+                app.logger.error(f"Credentials file not found: {GOOGLE_APPLICATION_CREDENTIALS}")
+    
+    app.logger.error("No valid Google Cloud credentials found")
+    return None
 
 # Configure Gemini
 if GEMINI_API_KEY:
@@ -54,8 +101,14 @@ else:
 
 class MalayalamVoiceBot:
     def __init__(self):
-        self.speech_client = speech.SpeechClient()
-        self.tts_client = texttospeech.TextToSpeechClient()
+        # Setup Google Cloud credentials
+        self.credentials = setup_google_credentials()
+        if not self.credentials:
+            raise Exception("Failed to setup Google Cloud credentials")
+        
+        # Initialize Google Cloud clients with credentials
+        self.speech_client = speech.SpeechClient(credentials=self.credentials)
+        self.tts_client = texttospeech.TextToSpeechClient(credentials=self.credentials)
         self.conversation_history = []
         
         # Malayalam TTS voice configuration
@@ -236,7 +289,6 @@ class TranscriptionHandler:
             app.logger.error(f"Error sending audio response: {str(e)}")
 
 # Global instances
-voicebot = MalayalamVoiceBot()
 active_streams = {}
 
 @sockets.route('/media')
@@ -275,7 +327,7 @@ def handle_media_stream(ws):
                     sample_rate_hertz=RATE,
                     language_code="ml-IN",  # Malayalam
                     enable_automatic_punctuation=True,
-                    model="latest_long"
+                    model="telephony"  # Better for phone calls
                 )
                 
                 streaming_config = speech.StreamingRecognitionConfig(
@@ -359,11 +411,20 @@ def exotel_webhook():
 
 if __name__ == '__main__':
     # Validate environment variables
-    if not GOOGLE_APPLICATION_CREDENTIALS:
-        app.logger.warning("GOOGLE_APPLICATION_CREDENTIALS not set")
+    if not GOOGLE_APPLICATION_CREDENTIALS and not GOOGLE_CLOUD_CREDENTIALS_JSON:
+        app.logger.error("No Google Cloud credentials found. Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_CREDENTIALS_JSON")
+        sys.exit(1)
     
     if not GEMINI_API_KEY:
         app.logger.error("GEMINI_API_KEY not set")
+        sys.exit(1)
+
+    # Initialize voicebot (this will test credentials)
+    try:
+        voicebot = MalayalamVoiceBot()
+        app.logger.info("MalayalamVoiceBot initialized successfully")
+    except Exception as e:
+        app.logger.error(f"Failed to initialize MalayalamVoiceBot: {str(e)}")
         sys.exit(1)
 
     parser = argparse.ArgumentParser(description='Malayalam Exotel VoiceBot')
