@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: malayalam-voicebot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        sync: false
+    scaling:
+      minInstances: 1
+      maxInstances: 3
+    disk:
+      name: logs
+      mountPath: /opt/render/project/src/logs
+      sizeGB: 1

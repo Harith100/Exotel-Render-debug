@@ -1,1 +1,3 @@
-env310
+env310/
+ignore
+test.ipynb
