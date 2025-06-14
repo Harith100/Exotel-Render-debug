@@ -489,12 +489,20 @@ def exotel_webhook():
         app.logger.error(f"Webhook error: {str(e)}")
         return {'status': 'error', 'message': str(e)}, 500
 
-@app.route('/test-tts', methods=['POST'])
+@app.route('/test-tts', methods=['GET', 'POST'])
 def test_tts():
     """Test endpoint for TTS functionality"""
     try:
-        data = request.get_json()
-        text = data.get('text', 'ഹലോ, എങ്ങനെയുണ്ട്?')  # "Hello, how are you?" in Malayalam
+        if request.method == 'GET':
+            # GET request - use default text
+            text = 'ഹലോ, എങ്ങനെയുണ്ട്?'  # "Hello, how are you?" in Malayalam
+        else:
+            # POST request - get text from JSON or form data
+            if request.is_json:
+                data = request.get_json() or {}
+                text = data.get('text', 'ഹലോ, എങ്ങനെയുണ്ട്?')
+            else:
+                text = request.form.get('text', 'ഹലോ, എങ്ങനെയുണ്ട്?')
         
         voicebot = MalayalamVoiceBot()
         audio_content = voicebot.text_to_speech(text)
@@ -505,7 +513,8 @@ def test_tts():
                 'status': 'success',
                 'text': text,
                 'audio_length': len(audio_content),
-                'audio_base64': audio_b64[:100] + '...'  # First 100 chars for testing
+                'audio_base64_preview': audio_b64[:100] + '...',  # First 100 chars for testing
+                'method': request.method
             }
         else:
             return {'status': 'error', 'message': 'Failed to generate audio'}
@@ -514,7 +523,90 @@ def test_tts():
         app.logger.error(f"TTS test error: {str(e)}")
         return {'status': 'error', 'message': str(e)}, 500
 
-if __name__ == '__main__':
+@app.route('/test-gemini', methods=['GET', 'POST'])
+def test_gemini():
+    """Test endpoint for Gemini functionality"""
+    try:
+        if request.method == 'GET':
+            # GET request - use default text
+            text = 'Hello, how are you?'
+        else:
+            # POST request - get text from JSON or form data
+            if request.is_json:
+                data = request.get_json() or {}
+                text = data.get('text', 'Hello, how are you?')
+            else:
+                text = request.form.get('text', 'Hello, how are you?')
+        
+        voicebot = MalayalamVoiceBot()
+        response = voicebot.get_gemini_response(text)
+        
+        return {
+            'status': 'success',
+            'input_text': text,
+            'gemini_response': response,
+            'method': request.method
+        }
+            
+    except Exception as e:
+        app.logger.error(f"Gemini test error: {str(e)}")
+        return {'status': 'error', 'message': str(e)}, 500
+
+@app.route('/test', methods=['GET'])
+def test_all():
+    """Combined test endpoint for all components"""
+    results = {}
+    
+    # Test environment variables
+    results['environment'] = {
+        'google_credentials': bool(GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_CREDENTIALS_JSON),
+        'gemini_api_key': bool(GEMINI_API_KEY),
+        'active_streams': len(active_streams)
+    }
+    
+    # Test Google Cloud credentials
+    try:
+        credentials = setup_google_credentials()
+        results['credentials'] = {
+            'status': 'success' if credentials else 'failed',
+            'type': type(credentials).__name__ if credentials else None
+        }
+    except Exception as e:
+        results['credentials'] = {
+            'status': 'error',
+            'message': str(e)
+        }
+    
+    # Test TTS
+    try:
+        voicebot = MalayalamVoiceBot()
+        audio_content = voicebot.text_to_speech('ഹലോ')
+        results['tts'] = {
+            'status': 'success' if audio_content else 'failed',
+            'audio_length': len(audio_content) if audio_content else 0
+        }
+    except Exception as e:
+        results['tts'] = {
+            'status': 'error',
+            'message': str(e)
+        }
+    
+    # Test Gemini
+    try:
+        if 'voicebot' not in locals():
+            voicebot = MalayalamVoiceBot()
+        response = voicebot.get_gemini_response('Hello')
+        results['gemini'] = {
+            'status': 'success',
+            'response_length': len(response) if response else 0
+        }
+    except Exception as e:
+        results['gemini'] = {
+            'status': 'error',
+            'message': str(e)
+        }
+    
+    return results
     # Validate environment variables
     if not GOOGLE_APPLICATION_CREDENTIALS and not GOOGLE_CLOUD_CREDENTIALS_JSON:
         app.logger.error("No Google Cloud credentials found. Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_CREDENTIALS_JSON")
