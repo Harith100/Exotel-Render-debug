@@ -10,6 +10,9 @@ from sarvam_client import SarvamClient
 from gemini_client import GeminiClient
 from utils import AudioUtils
 import socket
+import wave
+import struct
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
