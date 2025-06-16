@@ -18,7 +18,7 @@ import struct
 from typing import Optional, Dict, Any
 import time
 from google.oauth2 import service_account
-sock = Sock(app)
+
 
 # Configure logging
 logging.basicConfig(
@@ -447,6 +447,8 @@ async def websocket_handler(websocket, path):
 
 # Flask app for HTTP endpoints
 app = Flask(__name__)
+
+sock = Sock(app)
 
 @app.route('/health', methods=['GET'])
 def health_check():
