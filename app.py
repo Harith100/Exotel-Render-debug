@@ -6,6 +6,7 @@ import os
 import websockets
 from websockets.server import serve
 from flask import Flask, request, jsonify
+from flask_sock import Sock
 import threading
 from google.cloud import speech
 from google.cloud import texttospeech
@@ -17,7 +18,7 @@ import struct
 from typing import Optional, Dict, Any
 import time
 from google.oauth2 import service_account
-
+sock = Sock(app)
 
 # Configure logging
 logging.basicConfig(
@@ -248,6 +249,9 @@ class GeminiProcessor:
             
             response = gemini_model.generate_content(context)
             bot_response = response.text.strip()
+
+            
+
             
             # Store conversation
             self.conversation_history.append({
@@ -256,6 +260,10 @@ class GeminiProcessor:
                 'timestamp': datetime.now().isoformat()
             })
             
+            if not bot_response:
+                logger.warning("Empty Gemini response")
+                return "ക്ഷമിക്കണം, മറുപടി ലഭിച്ചില്ല."
+
             logger.info(f"Gemini response: {bot_response[:50]}...")
             return bot_response
             
@@ -492,6 +500,16 @@ def index():
             'websocket': 'wss://<host>/media'
         }
     })
+
+@sock.route('/media')
+def media(ws):
+    logger.info("📡 WebSocket /media connected.")
+    while True:
+        data = ws.receive()
+        if data is None:
+            break
+        logger.info(f"🎧 Received chunk: {len(data)} bytes")
+
 
 def run_flask_app():
     """Run Flask app in a separate thread"""
