@@ -1,395 +1,512 @@
 import asyncio
-import websockets
 import json
 import base64
 import logging
 import os
-from flask import Flask, jsonify, request
-from threading import Thread
-import google.cloud.speech as speech
-import google.cloud.texttospeech as tts
+import websockets
+from websockets.server import serve
+from flask import Flask, request, jsonify
+import threading
+from google.cloud import speech
+from google.cloud import texttospeech
 import google.generativeai as genai
-from google.oauth2 import service_account
+from datetime import datetime
+import wave
 import io
 import struct
+from typing import Optional, Dict, Any
 import time
-from collections import deque
-import math
-from config import get_config
 
-# Get configuration
-config = get_config()
-
-# Setup logging
-config.setup_logging()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# Flask app for dynamic endpoint
-app = Flask(__name__)
+# Configuration
+class Config:
+    # Google Cloud credentials should be set via environment variable
+    # GOOGLE_APPLICATION_CREDENTIALS should point to your service account JSON file
+    
+    # Gemini API configuration
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    
+    # Server configuration
+    HTTP_PORT = int(os.getenv('PORT', 5000))
+    WS_PORT = int(os.getenv('WS_PORT', 8765))
+    
+    # Audio configuration - matching Exotel specs
+    SAMPLE_RATE = 8000  # 8kHz as per Exotel
+    CHANNELS = 1        # mono
+    SAMPLE_WIDTH = 2    # 16-bit
+    
+    # Chunk size configuration (as per Exotel requirements)
+    MIN_CHUNK_SIZE = 3200   # 100ms data (3.2k)
+    MAX_CHUNK_SIZE = 100000 # 100k
+    CHUNK_MULTIPLE = 320    # Must be multiple of 320 bytes
 
-class MalayalamVoiceBot:
+# Initialize Google Cloud clients
+try:
+    speech_client = speech.SpeechClient()
+    tts_client = texttospeech.TextToSpeechClient()
+    logger.info("Google Cloud clients initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Google Cloud clients: {e}")
+    speech_client = None
+    tts_client = None
+
+# Initialize Gemini
+try:
+    genai.configure(api_key=Config.GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel('gemini-pro')
+    logger.info("Gemini API initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Gemini API: {e}")
+    gemini_model = None
+
+class AudioProcessor:
+    """Handle audio processing for speech recognition and synthesis"""
+    
+    @staticmethod
+    def decode_audio(base64_payload: str) -> bytes:
+        """Decode base64 audio payload from Exotel"""
+        try:
+            audio_data = base64.b64decode(base64_payload)
+            logger.debug(f"Decoded audio chunk: {len(audio_data)} bytes")
+            return audio_data
+        except Exception as e:
+            logger.error(f"Failed to decode audio: {e}")
+            return b''
+    
+    @staticmethod
+    def encode_audio(audio_data: bytes) -> str:
+        """Encode audio data to base64 for Exotel"""
+        try:
+            encoded = base64.b64encode(audio_data).decode('utf-8')
+            logger.debug(f"Encoded audio chunk: {len(audio_data)} bytes -> {len(encoded)} chars")
+            return encoded
+        except Exception as e:
+            logger.error(f"Failed to encode audio: {e}")
+            return ''
+    
+    @staticmethod
+    def ensure_chunk_size(audio_data: bytes) -> bytes:
+        """Ensure audio chunk size meets Exotel requirements"""
+        chunk_size = len(audio_data)
+        
+        if chunk_size < Config.MIN_CHUNK_SIZE:
+            # Pad with silence if too small
+            padding_needed = Config.MIN_CHUNK_SIZE - chunk_size
+            silence = b'\x00' * padding_needed
+            audio_data += silence
+            logger.debug(f"Padded audio chunk from {chunk_size} to {len(audio_data)} bytes")
+        
+        elif chunk_size > Config.MAX_CHUNK_SIZE:
+            # Truncate if too large
+            audio_data = audio_data[:Config.MAX_CHUNK_SIZE]
+            logger.debug(f"Truncated audio chunk from {chunk_size} to {len(audio_data)} bytes")
+        
+        # Ensure it's a multiple of 320 bytes
+        remainder = len(audio_data) % Config.CHUNK_MULTIPLE
+        if remainder != 0:
+            padding_needed = Config.CHUNK_MULTIPLE - remainder
+            audio_data += b'\x00' * padding_needed
+            logger.debug(f"Added {padding_needed} bytes padding for 320-byte alignment")
+        
+        return audio_data
+
+class SpeechProcessor:
+    """Handle speech-to-text and text-to-speech operations"""
+    
     def __init__(self):
-        # Validate configuration
-        config.validate_config()
+        self.audio_buffer = bytearray()
+        self.last_speech_time = time.time()
+        self.speech_timeout = 2.0  # 2 seconds of silence before processing
+    
+    async def process_speech(self, audio_data: bytes) -> Optional[str]:
+        """Process audio data and return recognized Malayalam text"""
+        if not speech_client:
+            logger.error("Speech client not initialized")
+            return None
         
-        self.setup_google_cloud()
-        self.setup_gemini()
-        
-        # Audio configuration from config
-        self.SAMPLE_RATE = config.SAMPLE_RATE
-        self.CHANNELS = config.CHANNELS
-        self.BYTES_PER_SAMPLE = config.BYTES_PER_SAMPLE
-        self.CHUNK_SIZE = config.CHUNK_SIZE
-        self.MIN_CHUNK_SIZE = config.MIN_CHUNK_SIZE
-        self.MAX_CHUNK_SIZE = config.MAX_CHUNK_SIZE
-        
-        # Streaming configuration
-        self.audio_buffer = deque()
-        self.is_speaking = False
-        self.conversation_context = []
-        
-    def setup_google_cloud(self):
-        """Setup Google Cloud STT and TTS clients"""
         try:
-            # Initialize clients - credentials should be set via environment
-            self.speech_client = speech.SpeechClient()
-            self.tts_client = tts.TextToSpeechClient()
+            self.audio_buffer.extend(audio_data)
+            self.last_speech_time = time.time()
             
-            # Configure speech recognition
-            self.speech_config = speech.RecognitionConfig(
+            # Check if we have enough audio data and silence timeout
+            if len(self.audio_buffer) < Config.MIN_CHUNK_SIZE * 3:  # Wait for at least 300ms
+                return None
+            
+            if time.time() - self.last_speech_time < self.speech_timeout:
+                return None
+            
+            # Convert audio buffer to proper format
+            audio_content = bytes(self.audio_buffer)
+            
+            # Configure recognition
+            config = speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=self.SAMPLE_RATE,
-                language_code=config.SPEECH_LANGUAGE_CODE,
+                sample_rate_hertz=Config.SAMPLE_RATE,
+                language_code="ml-IN",  # Malayalam
                 enable_automatic_punctuation=True,
+                model="latest_long"
             )
             
-            # Configure TTS voice
-            self.voice = tts.VoiceSelectionParams(
-                language_code=config.SPEECH_LANGUAGE_CODE,
-                name=config.TTS_VOICE_NAME,
-                ssml_gender=getattr(tts.SsmlVoiceGender, config.TTS_VOICE_GENDER)
-            )
+            audio = speech.RecognitionAudio(content=audio_content)
             
-            self.audio_config = tts.AudioConfig(
-                audio_encoding=tts.AudioEncoding.LINEAR16,
-                sample_rate_hertz=self.SAMPLE_RATE
-            )
+            # Perform speech recognition
+            response = speech_client.recognize(config=config, audio=audio)
             
-            logger.info("Google Cloud STT and TTS initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Google Cloud services: {e}")
-            raise
-    
-    def setup_gemini(self):
-        """Setup Gemini API"""
-        try:
-            genai.configure(api_key=config.GEMINI_API_KEY)
-            self.model = genai.GenerativeModel('gemini-pro')
-            
-            # System prompt from config
-            self.system_prompt = config.SYSTEM_PROMPT
-            
-            logger.info("Gemini API initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini API: {e}")
-            raise
-    
-    def validate_chunk_size(self, size):
-        """Validate chunk size according to Exotel requirements"""
-        if size < self.MIN_CHUNK_SIZE:
-            logger.warning(f"Chunk size {size} is below minimum {self.MIN_CHUNK_SIZE}")
-            return False
-        if size > self.MAX_CHUNK_SIZE:
-            logger.warning(f"Chunk size {size} exceeds maximum {self.MAX_CHUNK_SIZE}")
-            return False
-        if size % 320 != 0:
-            logger.warning(f"Chunk size {size} is not a multiple of {config.CHUNK_ALIGNMENT} bytes")
-            return False
-        return True
-    
-    async def transcribe_audio(self, audio_data):
-        """Transcribe audio using Google Cloud STT"""
-        try:
-            audio = speech.RecognitionAudio(content=audio_data)
-            response = self.speech_client.recognize(
-                config=self.speech_config, 
-                audio=audio
-            )
+            # Clear buffer after processing
+            self.audio_buffer.clear()
             
             if response.results:
                 transcript = response.results[0].alternatives[0].transcript
-                logger.info(f"Transcribed: {transcript}")
+                logger.info(f"Speech recognized: {transcript}")
                 return transcript
-            return None
-            
+            else:
+                logger.debug("No speech recognized")
+                return None
+                
         except Exception as e:
-            logger.error(f"Transcription error: {e}")
+            logger.error(f"Speech recognition error: {e}")
+            self.audio_buffer.clear()
             return None
     
-    async def generate_response(self, user_input):
-        """Generate response using Gemini API"""
+    async def synthesize_speech(self, text: str) -> Optional[bytes]:
+        """Convert Malayalam text to speech"""
+        if not tts_client:
+            logger.error("TTS client not initialized")
+            return None
+        
         try:
-            # Add context to the conversation
-            self.conversation_context.append(f"User: {user_input}")
+            synthesis_input = texttospeech.SynthesisInput(text=text)
             
-            # Create prompt with context
-            context = "\n".join(self.conversation_context[-config.MAX_CONVERSATION_HISTORY:])
-            prompt = f"{self.system_prompt}\n\nConversation context:\n{context}\n\nPlease respond to the user's last message:"
-            
-            response = self.model.generate_content(prompt)
-            ai_response = response.text
-            
-            self.conversation_context.append(f"Assistant: {ai_response}")
-            logger.info(f"Generated response: {ai_response}")
-            
-            return ai_response
-            
-        except Exception as e:
-            logger.error(f"Response generation error: {e}")
-            return "Sorry, I couldn't understand that. Could you please repeat?"
-    
-    async def synthesize_speech(self, text):
-        """Convert text to speech using Google Cloud TTS"""
-        try:
-            synthesis_input = tts.SynthesisInput(text=text)
-            
-            response = self.tts_client.synthesize_speech(
-                input=synthesis_input,
-                voice=self.voice,
-                audio_config=self.audio_config
+            voice = texttospeech.VoiceSelectionParams(
+                language_code="ml-IN",  # Malayalam
+                ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
             )
             
-            logger.info(f"Synthesized {len(response.audio_content)} bytes of audio")
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                sample_rate_hertz=Config.SAMPLE_RATE
+            )
+            
+            response = tts_client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice,
+                audio_config=audio_config
+            )
+            
+            logger.info(f"TTS synthesized for text: {text[:50]}...")
             return response.audio_content
             
         except Exception as e:
-            logger.error(f"Speech synthesis error: {e}")
+            logger.error(f"TTS synthesis error: {e}")
             return None
+
+class GeminiProcessor:
+    """Handle Gemini API interactions"""
     
-    def chunk_audio(self, audio_data):
-        """Split audio into valid chunks for Exotel"""
-        chunks = []
-        for i in range(0, len(audio_data), self.CHUNK_SIZE):
-            chunk = audio_data[i:i + self.CHUNK_SIZE]
-            
-            # Pad the last chunk if necessary to maintain 320-byte alignment
-            if len(chunk) < self.CHUNK_SIZE and len(chunk) % 320 != 0:
-                padding_needed = 320 - (len(chunk) % 320)
-                chunk += b'\x00' * padding_needed
-            
-            if self.validate_chunk_size(len(chunk)):
-                chunks.append(chunk)
-            else:
-                logger.warning(f"Skipping invalid chunk of size {len(chunk)}")
-        
-        return chunks
+    def __init__(self):
+        self.conversation_history = []
     
-    async def handle_websocket(self, websocket, path):
-        """Handle WebSocket connection from Exotel"""
-        logger.info(f"New WebSocket connection: {websocket.remote_address}")
+    async def get_response(self, user_input: str) -> str:
+        """Get response from Gemini for Malayalam input"""
+        if not gemini_model:
+            logger.error("Gemini model not initialized")
+            return "ക്ഷമിക്കണം, എനിക്ക് ഇപ്പോൾ മറുപടി നൽകാൻ കഴിയുന്നില്ല."  # Sorry, I can't respond right now
         
         try:
-            stream_sid = None
-            audio_buffer = b''
-            sequence_number = 1
+            # Add context for Malayalam conversation
+            system_prompt = """You are a helpful AI assistant that responds in Malayalam. 
+            Keep responses concise and natural for voice conversation. 
+            Respond only in Malayalam language."""
             
-            async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    event = data.get('event')
-                    
-                    logger.info(f"Received event: {event}")
-                    
-                    if event == 'connected':
-                        logger.info("WebSocket connected")
-                        
-                    elif event == 'start':
-                        stream_sid = data['stream_sid']
-                        call_info = data['start']
-                        logger.info(f"Stream started: {stream_sid}")
-                        logger.info(f"Call from {call_info.get('from')} to {call_info.get('to')}")
-                        
-                        # Send initial greeting
-                        greeting = config.GREETING_MESSAGE
-                        await self.send_audio_response(websocket, stream_sid, greeting, sequence_number)
-                        sequence_number += 1
-                        
-                    elif event == 'media':
-                        media_data = data['media']
-                        payload = base64.b64decode(media_data['payload'])
-                        
-                        # Accumulate audio data
-                        audio_buffer += payload
-                        
-                        # Process when we have enough data
-                        if len(audio_buffer) >= config.AUDIO_BUFFER_SIZE:
-                            transcript = await self.transcribe_audio(audio_buffer)
-                            
-                            if transcript and transcript.strip():
-                                logger.info(f"Processing transcript: {transcript}")
-                                
-                                # Generate and send response
-                                response_text = await self.generate_response(transcript)
-                                await self.send_audio_response(websocket, stream_sid, response_text, sequence_number)
-                                sequence_number += 1
-                            
-                            # Reset buffer
-                            audio_buffer = b''
-                    
-                    elif event == 'dtmf':
-                        dtmf_data = data['dtmf']
-                        logger.info(f"DTMF pressed: {dtmf_data['digit']}")
-                        
-                    elif event == 'stop':
-                        stop_data = data['stop']
-                        logger.info(f"Stream stopped: {stop_data.get('reason')}")
-                        break
-                        
-                    elif event == 'mark':
-                        mark_data = data['mark']
-                        logger.info(f"Mark received: {mark_data.get('name')}")
-                        
-                except json.JSONDecodeError as e:
-                    logger.error(f"JSON decode error: {e}")
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    
+            # Build conversation context
+            context = system_prompt + "\n\n"
+            for msg in self.conversation_history[-5:]:  # Keep last 5 exchanges
+                context += f"User: {msg['user']}\nAssistant: {msg['assistant']}\n"
+            context += f"User: {user_input}\nAssistant: "
+            
+            response = gemini_model.generate_content(context)
+            bot_response = response.text.strip()
+            
+            # Store conversation
+            self.conversation_history.append({
+                'user': user_input,
+                'assistant': bot_response,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            logger.info(f"Gemini response: {bot_response[:50]}...")
+            return bot_response
+            
+        except Exception as e:
+            logger.error(f"Gemini API error: {e}")
+            return "ക്ഷമിക്കണം, എനിക്ക് ഇപ്പോൾ മറുപടി നൽകാൻ കഴിയുന്നില്ല."
+
+class ExotelWebSocketHandler:
+    """Handle WebSocket communication with Exotel"""
+    
+    def __init__(self, websocket, path):
+        self.websocket = websocket
+        self.path = path
+        self.stream_sid = None
+        self.call_sid = None
+        self.sequence_number = 0
+        self.speech_processor = SpeechProcessor()
+        self.gemini_processor = GeminiProcessor()
+        logger.info(f"New WebSocket connection: {path}")
+    
+    async def handle_connection(self):
+        """Main WebSocket message handler"""
+        try:
+            async for message in self.websocket:
+                await self.process_message(message)
         except websockets.exceptions.ConnectionClosed:
-            logger.info("WebSocket connection closed")
+            logger.info(f"WebSocket connection closed: {self.stream_sid}")
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
     
-    async def send_audio_response(self, websocket, stream_sid, text, sequence_number):
+    async def process_message(self, message: str):
+        """Process incoming WebSocket message from Exotel"""
+        try:
+            data = json.loads(message)
+            event = data.get('event')
+            
+            logger.debug(f"Received event: {event}")
+            
+            if event == 'connected':
+                await self.handle_connected(data)
+            elif event == 'start':
+                await self.handle_start(data)
+            elif event == 'media':
+                await self.handle_media(data)
+            elif event == 'dtmf':
+                await self.handle_dtmf(data)
+            elif event == 'stop':
+                await self.handle_stop(data)
+            elif event == 'mark':
+                await self.handle_mark(data)
+            else:
+                logger.warning(f"Unknown event type: {event}")
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON message: {e}")
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+    
+    async def handle_connected(self, data):
+        """Handle connected event"""
+        logger.info("WebSocket connected to Exotel")
+    
+    async def handle_start(self, data):
+        """Handle start event"""
+        start_data = data.get('start', {})
+        self.stream_sid = start_data.get('stream_sid')
+        self.call_sid = start_data.get('call_sid')
+        
+        logger.info(f"Stream started - SID: {self.stream_sid}, Call: {self.call_sid}")
+        
+        # Send welcome message
+        welcome_text = "നമസ്കാരം! ഞാൻ നിങ്ങളുടെ സഹായിയാണ്. എന്തെങ്കിലും ചോദിക്കാനുണ്ടോ?"  # Hello! I'm your assistant. Do you have any questions?
+        await self.send_tts_response(welcome_text)
+    
+    async def handle_media(self, data):
+        """Handle media event (incoming audio)"""
+        media_data = data.get('media', {})
+        payload = media_data.get('payload', '')
+        
+        if payload:
+            # Decode audio
+            audio_data = AudioProcessor.decode_audio(payload)
+            
+            # Process speech
+            transcript = await self.speech_processor.process_speech(audio_data)
+            
+            if transcript:
+                logger.info(f"User said: {transcript}")
+                
+                # Get response from Gemini
+                bot_response = await self.gemini_processor.get_response(transcript)
+                
+                # Convert response to speech and send
+                await self.send_tts_response(bot_response)
+    
+    async def handle_dtmf(self, data):
+        """Handle DTMF event"""
+        dtmf_data = data.get('dtmf', {})
+        digit = dtmf_data.get('digit')
+        logger.info(f"DTMF received: {digit}")
+    
+    async def handle_stop(self, data):
+        """Handle stop event"""
+        logger.info(f"Stream stopped: {self.stream_sid}")
+    
+    async def handle_mark(self, data):
+        """Handle mark event"""
+        mark_data = data.get('mark', {})
+        name = mark_data.get('name')
+        logger.debug(f"Mark received: {name}")
+    
+    async def send_tts_response(self, text: str):
         """Convert text to speech and send to Exotel"""
         try:
             # Synthesize speech
-            audio_data = await self.synthesize_speech(text)
+            audio_data = await self.speech_processor.synthesize_speech(text)
+            
             if not audio_data:
+                logger.error("Failed to synthesize speech")
                 return
             
-            # Send mark to indicate start of audio
-            mark_message = {
-                "event": "mark",
-                "sequence_number": sequence_number,
-                "stream_sid": stream_sid,
-                "mark": {
-                    "name": f"start_audio_{sequence_number}"
-                }
-            }
-            await websocket.send(json.dumps(mark_message))
-            
             # Split audio into chunks and send
-            chunks = self.chunk_audio(audio_data)
-            timestamp = 0
+            await self.send_audio_chunks(audio_data)
             
-            for i, chunk in enumerate(chunks):
+        except Exception as e:
+            logger.error(f"Error sending TTS response: {e}")
+    
+    async def send_audio_chunks(self, audio_data: bytes):
+        """Send audio data in chunks to Exotel"""
+        try:
+            chunk_size = Config.MIN_CHUNK_SIZE * 4  # Use 4x minimum for better performance
+            
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:i + chunk_size]
+                
+                # Ensure chunk meets requirements
+                chunk = AudioProcessor.ensure_chunk_size(chunk)
+                
+                # Encode chunk
+                encoded_chunk = AudioProcessor.encode_audio(chunk)
+                
+                # Create media message
                 media_message = {
                     "event": "media",
-                    "sequence_number": sequence_number + i + 1,
-                    "stream_sid": stream_sid,
+                    "sequence_number": self.sequence_number,
+                    "stream_sid": self.stream_sid,
                     "media": {
-                        "chunk": i,
-                        "timestamp": str(timestamp),
-                        "payload": base64.b64encode(chunk).decode('utf-8')
+                        "chunk": i // chunk_size,
+                        "timestamp": str(int(time.time() * 1000)),
+                        "payload": encoded_chunk
                     }
                 }
                 
-                await websocket.send(json.dumps(media_message))
+                # Send message
+                await self.websocket.send(json.dumps(media_message))
+                self.sequence_number += 1
                 
-                # Calculate timestamp for next chunk (in milliseconds)
-                chunk_duration_ms = (len(chunk) // self.BYTES_PER_SAMPLE) * 1000 // self.SAMPLE_RATE
-                timestamp += chunk_duration_ms
-                
-                # Small delay to avoid overwhelming the connection
-                await asyncio.sleep(0.01)
+                logger.debug(f"Sent audio chunk {i // chunk_size}")
             
-            # Send mark to indicate end of audio
-            end_mark_message = {
+            # Send mark to track completion
+            mark_message = {
                 "event": "mark",
-                "sequence_number": sequence_number + len(chunks) + 1,
-                "stream_sid": stream_sid,
+                "sequence_number": self.sequence_number,
+                "stream_sid": self.stream_sid,
                 "mark": {
-                    "name": f"end_audio_{sequence_number}"
+                    "name": f"audio_complete_{int(time.time())}"
                 }
             }
-            await websocket.send(json.dumps(end_mark_message))
             
-            logger.info(f"Sent audio response with {len(chunks)} chunks")
+            await self.websocket.send(json.dumps(mark_message))
+            self.sequence_number += 1
             
         except Exception as e:
-            logger.error(f"Error sending audio response: {e}")
+            logger.error(f"Error sending audio chunks: {e}")
 
-# Initialize the bot
-bot = MalayalamVoiceBot()
+# WebSocket server handler
+async def websocket_handler(websocket, path):
+    """WebSocket connection handler"""
+    handler = ExotelWebSocketHandler(websocket, path)
+    await handler.handle_connection()
 
-# Flask routes for dynamic endpoint
-@app.route('/', methods=['GET', 'POST'])
-def get_websocket_url():
-    """Return WebSocket URL for Exotel to connect to"""
-    try:
-        # Get WebSocket URL using config
-        websocket_url = config.get_websocket_url(request.url_root)
-        
-        logger.info(f"Returning WebSocket URL: {websocket_url}")
-        
-        return jsonify({
-            "websocket_url": websocket_url,
-            "status": "ready"
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in get_websocket_url: {e}")
-        return jsonify({"error": str(e)}), 500
+# Flask app for HTTP endpoints
+app = Flask(__name__)
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({"status": "healthy", "service": "malayalam-voicebot"})
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'services': {
+            'speech_client': speech_client is not None,
+            'tts_client': tts_client is not None,
+            'gemini_model': gemini_model is not None
+        }
+    })
 
-# WebSocket server
-async def start_websocket_server():
-    """Start the WebSocket server"""
-    port = config.WEBSOCKET_PORT
-    logger.info(f"Starting WebSocket server on port {port}")
-    
-    server = await websockets.serve(
-        bot.handle_websocket,
-        "0.0.0.0",
-        port,
-        ping_interval=config.WEBSOCKET_PING_INTERVAL,
-        ping_timeout=config.WEBSOCKET_PING_TIMEOUT,
-        max_size=config.WEBSOCKET_MAX_SIZE
-    )
-    
-    logger.info(f"WebSocket server started on ws://0.0.0.0:{port}")
-    return server
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Dynamic WebSocket endpoint for Exotel"""
+    try:
+        # Get request data
+        data = request.get_json() or {}
+        
+        # You can add custom logic here to return different WebSocket URLs
+        # based on the call parameters
+        
+        # For now, return a static WebSocket URL
+        ws_url = f"wss://{request.host}/media"
+        
+        logger.info(f"Returning WebSocket URL: {ws_url}")
+        
+        return jsonify({
+            'websocket_url': ws_url,
+            'status': 'success'
+        })
+        
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({
+            'error': 'Internal server error',
+            'status': 'error'
+        }), 500
 
-def run_flask():
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint"""
+    return jsonify({
+        'service': 'Exotel Malayalam Voice Bot',
+        'status': 'running',
+        'endpoints': {
+            'health': '/health',
+            'webhook': '/webhook',
+            'websocket': 'wss://<host>/media'
+        }
+    })
+
+def run_flask_app():
     """Run Flask app in a separate thread"""
-    port = config.FLASK_PORT
-    logger.info(f"Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=config.DEBUG if hasattr(config, 'DEBUG') else False)
+    app.run(host='0.0.0.0', port=Config.HTTP_PORT, debug=False)
 
 async def main():
-    """Main function to start both servers"""
-    # Start Flask in a separate thread
-    flask_thread = Thread(target=run_flask, daemon=True)
+    """Main function to start both HTTP and WebSocket servers"""
+    logger.info("Starting Exotel Malayalam Voice Bot")
+    
+    # Validate configuration
+    if not Config.GEMINI_API_KEY:
+        logger.error("GEMINI_API_KEY environment variable not set")
+        return
+    
+    # Start Flask app in background thread
+    flask_thread = threading.Thread(target=run_flask_app)
+    flask_thread.daemon = True
     flask_thread.start()
     
+    logger.info(f"HTTP server started on port {Config.HTTP_PORT}")
+    
     # Start WebSocket server
-    server = await start_websocket_server()
+    logger.info(f"Starting WebSocket server on port {Config.WS_PORT}")
     
-    logger.info("Both servers started successfully")
-    
-    # Keep the servers running
-    try:
-        await server.wait_closed()
-    except KeyboardInterrupt:
-        logger.info("Shutting down servers...")
-        server.close()
-        await server.wait_closed()
+    async with serve(websocket_handler, "0.0.0.0", Config.WS_PORT):
+        logger.info("WebSocket server started successfully")
+        await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":
     asyncio.run(main())

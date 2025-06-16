@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.9-slim
 
 # Set working directory
 WORKDIR /app
@@ -9,14 +9,15 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
+
+# Create logs directory
+RUN mkdir -p /app/logs
 
 # Expose ports
 EXPOSE 5000 8765
@@ -25,5 +26,5 @@ EXPOSE 5000 8765
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-# Command to run the application
-CMD ["python", "main.py"]
+# Run the application
+CMD ["python", "app.py"]

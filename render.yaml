@@ -1,18 +1,16 @@
 services:
   - type: web
-    name: malayalam-voicebot
+    name: exotel-malayalam-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python app.py
     envVars:
       - key: PORT
-        value: 5000
+        value: 10000
       - key: WS_PORT
-        value: 8765
-      - key: GOOGLE_APPLICATION_CREDENTIALS
-        sync: false
+        value: 10001
       - key: GEMINI_API_KEY
         sync: false
-      - key: BASE_URL
+      - key: GOOGLE_APPLICATION_CREDENTIALS
         sync: false
-    healthCheckPath: /health
+    plan: starter

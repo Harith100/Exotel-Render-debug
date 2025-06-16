@@ -1,8 +1,0 @@
-2025-06-14 22:40:15,491 - app - ERROR - GEMINI_API_KEY not found in environment variables
-2025-06-14 22:42:11,667 - app - INFO - MalayalamVoiceBot initialized
-2025-06-14 22:42:11,670 - app - INFO - Starting Malayalam VoiceBot server on 0.0.0.0:5000
-2025-06-14 22:42:11,670 - app - INFO - WebSocket endpoint: ws://0.0.0.0:5000/media
-2025-06-14 22:42:11,670 - app - INFO - Health check: http://0.0.0.0:5000/health
-2025-06-14 22:42:54,812 - geventwebsocket.handler - INFO - 127.0.0.1 - - [2025-06-14 22:42:54] "GET /health HTTP/1.1" 200 189 0.001000
-2025-06-14 22:42:54,844 - geventwebsocket.handler - INFO - 127.0.0.1 - - [2025-06-14 22:42:54] "GET /favicon.ico HTTP/1.1" 404 331 0.001509
-2025-06-14 22:46:42,076 - app - INFO - Shutting down gracefully...
