@@ -3,16 +3,16 @@ services:
     name: malayalam-voicebot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: python main.py
     envVars:
+      - key: PORT
+        value: 5000
+      - key: WS_PORT
+        value: 8765
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        sync: false
       - key: GEMINI_API_KEY
         sync: false
-      - key: GOOGLE_CLOUD_CREDENTIALS_JSON
+      - key: BASE_URL
         sync: false
-    scaling:
-      minInstances: 1
-      maxInstances: 3
-    disk:
-      name: logs
-      mountPath: /opt/render/project/src/logs
-      sizeGB: 1
+    healthCheckPath: /health

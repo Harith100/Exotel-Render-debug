@@ -9,26 +9,21 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
+# Copy requirements first for better caching
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
 
-# Create logs directory
-RUN mkdir -p logs
-
-# Expose port
-EXPOSE 5000
+# Expose ports
+EXPOSE 5000 8765
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV PORT=5000
+ENV PYTHONPATH=/app
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:5000/health || exit 1
-
-# Run the application
-CMD ["python", "app.py"]
+# Command to run the application
+CMD ["python", "main.py"]
