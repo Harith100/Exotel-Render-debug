@@ -453,26 +453,26 @@ def health_check():
         }
     })
 
-@app.route('/webhook', methods=['POST'])
+@app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     """Dynamic WebSocket endpoint for Exotel"""
     try:
-        # Get request data
-        data = request.get_json() or {}
-        
-        # You can add custom logic here to return different WebSocket URLs
-        # based on the call parameters
-        
-        # For now, return a static WebSocket URL
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or request.form.to_dict()
+        else:  # GET method (used by Exotel for initial webhook ping or setup)
+            data = request.args.to_dict()
+
+        logger.info(f"🔁 Webhook triggered. Method: {request.method}")
+        logger.info(f"📨 Data: {data}")
+
+        # Construct WebSocket URL dynamically
         ws_url = f"wss://{request.host}/media"
-        
-        logger.info(f"Returning WebSocket URL: {ws_url}")
-        
+
         return jsonify({
             'websocket_url': ws_url,
             'status': 'success'
         })
-        
+
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return jsonify({
