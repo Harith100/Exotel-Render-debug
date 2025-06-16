@@ -29,6 +29,11 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# Flask app for HTTP endpoints
+app = Flask(__name__)
+
+sock = Sock(app)
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -445,10 +450,6 @@ async def websocket_handler(websocket, path):
     handler = ExotelWebSocketHandler(websocket, path)
     await handler.handle_connection()
 
-# Flask app for HTTP endpoints
-app = Flask(__name__)
-
-sock = Sock(app)
 
 @app.route('/health', methods=['GET'])
 def health_check():
