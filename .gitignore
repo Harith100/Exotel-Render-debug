@@ -1,3 +1,4 @@
 env310/
 ignore
 .env
+GOOGLE_CLOUD_CREDENTIALS_JSON.json
