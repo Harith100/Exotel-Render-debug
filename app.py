@@ -16,6 +16,8 @@ import io
 import struct
 from typing import Optional, Dict, Any
 import time
+from google.oauth2 import service_account
+
 
 # Configure logging
 logging.basicConfig(
@@ -51,14 +53,24 @@ class Config:
     CHUNK_MULTIPLE = 320    # Must be multiple of 320 bytes
 
 # Initialize Google Cloud clients
+# Initialize Google Cloud clients with credentials from env variable
 try:
-    speech_client = speech.SpeechClient()
-    tts_client = texttospeech.TextToSpeechClient()
-    logger.info("Google Cloud clients initialized successfully")
+    credentials_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if not credentials_json:
+        raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable is missing")
+
+    service_account_info = json.loads(credentials_json)
+    credentials = service_account.Credentials.from_service_account_info(service_account_info)
+
+    speech_client = speech.SpeechClient(credentials=credentials)
+    tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
+    
+    logger.info("✅ Google Cloud clients initialized successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize Google Cloud clients: {e}")
+    logger.error(f"❌ Failed to initialize Google Cloud clients: {e}")
     speech_client = None
     tts_client = None
+
 
 # Initialize Gemini
 try:
